@@ -1,0 +1,773 @@
+rom __future__ import annotations
+
+import csv
+import json
+import os
+import random
+import re
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import google.generativeai as genai
+from pypdf import PdfReader
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(os.getenv("BASE_DIR", r"C:\Users\OMOPEKUNOLA MOSES O\NST"))
+
+REAL_PILOT_ITEM_STATS = Path(
+    os.getenv("REAL_PILOT_ITEM_STATS", str(BASE_DIR / "real_pilot_item_stats.csv"))
+)
+
+SOURCE_ITEMS_PDF = Path(
+    os.getenv("SOURCE_ITEMS_PDF", str(BASE_DIR / "UTME Physics Mock Test.pdf"))
+)
+
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "generated_new_form")))
+FORM_ID = os.getenv("FORM_ID", "C")
+
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "models/gemini-3-pro-preview")
+MAX_GEN_ATTEMPTS = int(os.getenv("MAX_GEN_ATTEMPTS", "3"))
+SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "1.0"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.35"))
+N_ITEMS = int(os.getenv("N_ITEMS", "40"))
+
+DEBUG_SOURCE_PARSE = os.getenv("DEBUG_SOURCE_PARSE", "1").strip() == "1"
+
+
+# ============================================================
+# Q-MATRIX BLUEPRINT
+# ============================================================
+
+ATTRIBUTE_DEFS: Dict[str, str] = {
+    "A1": "Vector vs scalar identification",
+    "A2": "Vector resolution / components in 2D motion",
+    "A3": "Gravitation and escape velocity",
+    "A4": "Pascal principle / hydraulic systems",
+    "A5": "Hydrostatic pressure, buoyancy, terminal velocity",
+    "A6": "Thermal expansion",
+    "A7": "Statics, moments, frictional equilibrium",
+    "A8": "Energy conservation and elastic collision",
+    "A9": "Simple harmonic motion / spring-mass oscillation",
+    "A10": "Simple machines, screw jack, efficiency",
+    "A11": "Thermal physics: heat transfer and phase-change concepts",
+    "A12": "Doppler effect / sound in motion",
+    "A13": "Optics and nature of light",
+    "A14": "Electrostatics and charging by induction",
+    "A15": "Capacitors",
+    "A16": "Current electricity: emf, resistance, resistivity, terminal p.d.",
+    "A17": "Magnetism, electromagnetic induction, eddy currents",
+    "A18": "Conduction through gases / lightning protection",
+    "A19": "Atomic models and Rutherford limitations",
+    "A20": "Photoelectric effect",
+    "A21": "Radioactivity and decay",
+    "A22": "Band theory / conductors, semiconductors, insulators",
+    "A23": "Rectification / diode function",
+}
+
+ITEM_ATTRIBUTE_MAP: Dict[int, str] = {
+    1: "A1", 2: "A3", 3: "A4", 4: "A5", 5: "A6", 6: "A2", 7: "A7", 8: "A8",
+    9: "A4", 10: "A9", 11: "A10", 12: "A11", 13: "A5", 14: "A2", 15: "A11",
+    16: "A12", 17: "A13", 18: "A11", 19: "A13", 20: "A14", 21: "A14", 22: "A15",
+    23: "A16", 24: "A16", 25: "A16", 26: "A16", 27: "A17", 28: "A11", 29: "A17",
+    30: "A11", 31: "A17", 32: "A18", 33: "A18", 34: "A18", 35: "A19", 36: "A20",
+    37: "A21", 38: "A22", 39: "A19", 40: "A23",
+}
+
+RADICAL_HINTS: Dict[str, str] = {
+    "A1": "Require classification of a physical quantity as vector or scalar.",
+    "A2": "Require resolution into horizontal and vertical components.",
+    "A3": "Require reasoning about gravitational potential or escape velocity.",
+    "A4": "Require application of pressure transmission in hydraulic systems.",
+    "A5": "Require fluid-pressure or buoyancy reasoning, not memorization only.",
+    "A6": "Require thermal expansion relationship or consequence.",
+    "A7": "Require equilibrium of forces or moments, often with friction.",
+    "A8": "Require conservation of energy and/or collision outcome.",
+    "A9": "Require SHM period/frequency/spring-mass reasoning.",
+    "A10": "Require machine efficiency or mechanical advantage reasoning.",
+    "A11": "Require heat transfer, latent heat, boiling, or phase-change reasoning.",
+    "A12": "Require Doppler-shift direction reasoning.",
+    "A13": "Require a concept from geometrical or physical optics.",
+    "A14": "Require electrostatic induction or equilibrium reasoning.",
+    "A15": "Require capacitor combination or capacitance concept.",
+    "A16": "Require current electricity formula use or concept linkage.",
+    "A17": "Require induction, magnetism, or magnetic force reasoning.",
+    "A18": "Require conduction through gases or lightning protection concept.",
+    "A19": "Require atomic-model limitation or concept explanation.",
+    "A20": "Require photoelectric-effect concept or relation.",
+    "A21": "Require radioactive decay or half-life reasoning.",
+    "A22": "Require band-theory or semiconductor concept.",
+    "A23": "Require rectification or diode-direction understanding.",
+}
+
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
+@dataclass
+class BlueprintItem:
+    item_seq: int
+    attribute: str
+    attribute_definition: str
+    target_p_value: Optional[float] = None
+    target_rasch_beta: Optional[float] = None
+    source_stem: Optional[str] = None
+    source_options: Optional[Dict[str, str]] = None
+
+
+@dataclass
+class GeneratedItem:
+    form_id: str
+    item_seq: int
+    source_item_seq: int
+    attribute: str
+    target_p_value: Optional[float]
+    target_rasch_beta: Optional[float]
+    stem: str
+    options: Dict[str, str]
+    correct_option: str
+    explanation: str
+    distractor_analysis: Dict[str, str]
+    notation_style: str = "plain_utf8"
+
+
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
+
+def clean_text(text: str) -> str:
+    text = text.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_plain_utf8(text: str) -> str:
+    replacements = {
+        "**": "",
+        "$": "",
+        "\\sqrt": "√",
+        "\\times": "×",
+        "\\theta": "θ",
+        "\\alpha": "α",
+        "\\beta": "β",
+        "\\pi": "π",
+        "\\Omega": "Ω",
+        "\\mu": "μ",
+        "\\Delta": "Δ",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return clean_text(text)
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+def configure_model():
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("Set GEMINI_API_KEY or GOOGLE_API_KEY before running.")
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(GEMINI_MODEL_ID)
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match:
+        candidate = match.group(0).strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    raise ValueError("Could not parse JSON from model output.")
+
+
+def save_bad_model_output(text: str, item_seq: int, stage: str = "raw") -> None:
+    bad_dir = OUTPUT_DIR / "bad_model_outputs"
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    path = bad_dir / f"item_{item_seq}_{stage}.txt"
+    path.write_text(text, encoding="utf-8")
+
+
+def call_model_json(model, prompt: str, item_seq: int) -> Dict[str, Any]:
+    last_error = None
+
+    for _ in range(MAX_GEN_ATTEMPTS):
+        try:
+            response = model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": TEMPERATURE,
+                    "max_output_tokens": 4096,
+                    "response_mime_type": "application/json",
+                },
+            )
+
+            raw_text = (response.text or "").strip()
+
+            try:
+                return extract_json_object(raw_text)
+            except Exception:
+                save_bad_model_output(raw_text, item_seq, "raw")
+
+                repair_prompt = f"""
+The following output was intended to be JSON but is malformed.
+
+Your task:
+- convert it into VALID JSON
+- do not change the meaning
+- do not add extra commentary
+- return ONLY the repaired JSON object
+
+Malformed output:
+{raw_text}
+""".strip()
+
+                repair_response = model.generate_content(
+                    repair_prompt,
+                    generation_config={
+                        "temperature": 0.0,
+                        "max_output_tokens": 4096,
+                        "response_mime_type": "application/json",
+                    },
+                )
+
+                repaired_text = (repair_response.text or "").strip()
+                save_bad_model_output(repaired_text, item_seq, "repaired")
+                return extract_json_object(repaired_text)
+
+        except Exception as e:
+            last_error = e
+            time.sleep(SLEEP_BETWEEN_CALLS)
+
+    raise RuntimeError(f"Model call failed after retries: {last_error}")
+
+
+# ============================================================
+# INPUT LOADERS
+# ============================================================
+
+def load_real_pilot_stats(path: Path) -> Dict[int, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    stats: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        item_label = str(row.get("item", "")).strip()
+        m = re.search(r"(\d+)", item_label)
+        if not m:
+            continue
+        seq = int(m.group(1))
+        try:
+            stats[seq] = {
+                "target_p_value": float(row["p_value"]) if row.get("p_value") not in (None, "", "nan") else None,
+                "target_rasch_beta": float(row["rasch_beta"]) if row.get("rasch_beta") not in (None, "", "nan") else None,
+            }
+        except Exception:
+            stats[seq] = {"target_p_value": None, "target_rasch_beta": None}
+    return stats
+
+
+def clean_pdf_text(text: str) -> str:
+    text = text.replace("\r", "\n")
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
+def parse_standard_mcq_items(text: str) -> List[Dict[str, Any]]:
+    text = clean_pdf_text(text)
+    chunks = re.split(r"(?:^|\n)\s*(\d{1,2})\.\s+", text)
+    items: List[Dict[str, Any]] = []
+
+    if len(chunks) < 3:
+        return items
+
+    for i in range(1, len(chunks), 2):
+        try:
+            item_seq = int(chunks[i])
+            body = chunks[i + 1].strip()
+        except (ValueError, IndexError):
+            continue
+
+        if item_seq > 40:
+            continue
+
+        body = re.sub(r"\bA\.\s*A\.", "A.", body)
+        body = re.sub(r"\bB\.\s*B\.", "B.", body)
+        body = re.sub(r"\bC\.\s*C\.", "C.", body)
+        body = re.sub(r"\bD\.\s*D\.", "D.", body)
+
+        m = re.search(
+            r"^(.*?)\s+A\.\s*(.*?)\s+B\.\s*(.*?)\s+C\.\s*(.*?)\s+D\.\s*(.*)$",
+            body,
+            flags=re.DOTALL,
+        )
+        if not m:
+            continue
+
+        stem = clean_text(m.group(1))
+        options = {
+            "A": clean_text(m.group(2)),
+            "B": clean_text(m.group(3)),
+            "C": clean_text(m.group(4)),
+            "D": clean_text(m.group(5)),
+        }
+
+        items.append({
+            "item_seq": item_seq,
+            "stem": stem,
+            "options": options,
+        })
+
+    return items
+
+
+def load_source_items_from_pdf(path: Path) -> Dict[int, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+
+    reader = PdfReader(str(path))
+    full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    parsed_items = parse_standard_mcq_items(full_text)
+    return {item["item_seq"]: item for item in parsed_items}
+
+
+def build_blueprint() -> List[BlueprintItem]:
+    pilot_stats = load_real_pilot_stats(REAL_PILOT_ITEM_STATS)
+    source_items = load_source_items_from_pdf(SOURCE_ITEMS_PDF)
+
+    blueprint: List[BlueprintItem] = []
+    for item_seq in range(1, 41):
+        attr = ITEM_ATTRIBUTE_MAP[item_seq]
+        stat = pilot_stats.get(item_seq, {})
+        source = source_items.get(item_seq, {})
+
+        blueprint.append(
+            BlueprintItem(
+                item_seq=item_seq,
+                attribute=attr,
+                attribute_definition=ATTRIBUTE_DEFS[attr],
+                target_p_value=stat.get("target_p_value"),
+                target_rasch_beta=stat.get("target_rasch_beta"),
+                source_stem=source.get("stem"),
+                source_options=source.get("options"),
+            )
+        )
+    return blueprint[:N_ITEMS]
+
+
+# ============================================================
+# PROMPTS
+# ============================================================
+
+def difficulty_label(p_value: Optional[float], beta: Optional[float]) -> str:
+    if p_value is not None:
+        if p_value >= 0.60:
+            return "easy-to-moderate"
+        if p_value >= 0.35:
+            return "moderate"
+        return "moderate-to-hard"
+    if beta is not None:
+        if beta <= -0.4:
+            return "easy-to-moderate"
+        if beta <= 0.6:
+            return "moderate"
+        return "moderate-to-hard"
+    return "moderate"
+
+
+def build_generation_prompt(bp: BlueprintItem) -> str:
+    source_hint = ""
+    if bp.source_stem:
+        source_hint = f"""
+SOURCE ITEM (for blueprint only; do NOT copy wording):
+Stem: {bp.source_stem}
+Source options:
+A. {bp.source_options.get("A", "") if bp.source_options else ""}
+B. {bp.source_options.get("B", "") if bp.source_options else ""}
+C. {bp.source_options.get("C", "") if bp.source_options else ""}
+D. {bp.source_options.get("D", "") if bp.source_options else ""}
+"""
+
+    return f"""
+You are an expert Physics assessment developer.
+
+Generate ONE new UTME-style multiple-choice Physics item that is PARALLEL to a source item.
+
+Target blueprint:
+- Item sequence: {bp.item_seq}
+- Attribute code: {bp.attribute}
+- Attribute meaning: {bp.attribute_definition}
+- Radical requirement: {RADICAL_HINTS[bp.attribute]}
+- Desired difficulty profile: {difficulty_label(bp.target_p_value, bp.target_rasch_beta)}
+- Target p-value: {bp.target_p_value}
+- Target Rasch beta: {bp.target_rasch_beta}
+
+Parallel-form requirements:
+1. Preserve the same underlying construct and solution method.
+2. Change incidental features such as context, numbers, or wording.
+3. Do NOT copy the source item text.
+4. Keep the item exam-ready and concise.
+5. The item must have exactly four options, labeled A-D.
+6. There must be one clearly correct option.
+7. Distractors must be plausible and diagnostic.
+8. Preserve mathematical notation in robust plain UTF-8, not fragile LaTeX.
+   Examples: √, π, θ, α, Ω, μ, ×, ÷, 10⁻³, cm³, m s⁻¹.
+9. Do not use Markdown or code fences.
+10. Return ONLY valid JSON.
+11. Do not include any text before or after the JSON object.
+12. Ensure all strings are properly quoted and escaped.
+13. The output must be directly parseable by Python json.loads().
+14. The field correct_option must contain exactly one bare capital letter: A or B or C or D.
+
+{source_hint}
+
+Return JSON in exactly this structure:
+{{
+  "stem": "string",
+  "options": {{
+    "A": "string",
+    "B": "string",
+    "C": "string",
+    "D": "string"
+  }},
+  "correct_option": "A",
+  "explanation": "brief scoring explanation",
+  "distractor_analysis": {{
+    "A": "brief comment",
+    "B": "brief comment",
+    "C": "brief comment",
+    "D": "brief comment"
+  }}
+}}
+
+Do not use alternative keys such as question, item_text, answer, key, option_A, or choice_A unless forced by repair.
+""".strip()
+
+
+# ============================================================
+# VALIDATION / REPAIR
+# ============================================================
+
+def normalize_correct_option(value: Any, explanation: str = "") -> Optional[str]:
+    candidates = []
+    if value is not None:
+        candidates.append(str(value).strip())
+    if explanation:
+        candidates.append(str(explanation).strip())
+
+    patterns = [
+        r"^\s*([A-D])\s*$",
+        r"^\s*\(?([A-D])\)?\.?\s*$",
+        r"OPTION\s*([A-D])",
+        r"CORRECT\s*ANSWER\s*[:\-]?\s*([A-D])",
+        r"ANSWER\s*[:\-]?\s*([A-D])",
+        r"\b([A-D])\b",
+    ]
+
+    for text in candidates:
+        upper = text.upper()
+        for pat in patterns:
+            m = re.search(pat, upper, flags=re.IGNORECASE)
+            if m:
+                return m.group(1).upper()
+    return None
+
+
+def extract_stem_from_payload(payload: Dict[str, Any]) -> Optional[str]:
+    for key in ["stem", "question", "question_text", "item_text", "prompt"]:
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return normalize_plain_utf8(val)
+    return None
+
+
+def extract_options_from_payload(payload: Dict[str, Any]) -> Dict[str, str]:
+    options = payload.get("options")
+    if isinstance(options, dict):
+        out = {}
+        for k in ["A", "B", "C", "D"]:
+            val = options.get(k)
+            if val is None:
+                val = options.get(k.lower())
+            out[k] = normalize_plain_utf8(str(val)) if val is not None else ""
+        return out
+
+    out = {}
+    for k in ["A", "B", "C", "D"]:
+        candidates = [
+            f"option_{k}",
+            f"option{k}",
+            f"{k}",
+            f"choice_{k}",
+            f"choice{k}",
+        ]
+        val = None
+        for ck in candidates:
+            if ck in payload and payload[ck] not in (None, ""):
+                val = payload[ck]
+                break
+        out[k] = normalize_plain_utf8(str(val)) if val is not None else ""
+    return out
+
+
+def validate_generated_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    stem = extract_stem_from_payload(payload)
+    if not stem:
+        raise ValueError("Missing stem")
+
+    options = extract_options_from_payload(payload)
+    for k in ["A", "B", "C", "D"]:
+        if not options.get(k):
+            raise ValueError(f"Missing option {k}")
+
+    explanation = normalize_plain_utf8(str(payload.get("explanation", payload.get("solution", ""))))
+    correct = normalize_correct_option(
+        payload.get("correct_option", payload.get("answer", payload.get("key"))),
+        explanation,
+    )
+    if correct not in {"A", "B", "C", "D"}:
+        raise ValueError(f"Invalid correct_option: {payload.get('correct_option', payload.get('answer', payload.get('key')))}")
+
+    distractor = payload.get("distractor_analysis", payload.get("distractors", {}))
+    if not isinstance(distractor, dict):
+        distractor = {}
+
+    return {
+        "stem": stem,
+        "options": {k: options[k] for k in ["A", "B", "C", "D"]},
+        "correct_option": correct,
+        "explanation": explanation,
+        "distractor_analysis": {
+            k: normalize_plain_utf8(str(distractor.get(k, "")))
+            for k in ["A", "B", "C", "D"]
+        },
+    }
+
+
+def repair_payload_schema(model, payload: Dict[str, Any], item_seq: int) -> Dict[str, Any]:
+    repair_prompt = f"""
+Convert the following JSON object into the required schema.
+
+Required schema:
+{{
+  "stem": "string",
+  "options": {{
+    "A": "string",
+    "B": "string",
+    "C": "string",
+    "D": "string"
+  }},
+  "correct_option": "A",
+  "explanation": "string",
+  "distractor_analysis": {{
+    "A": "string",
+    "B": "string",
+    "C": "string",
+    "D": "string"
+  }}
+}}
+
+Rules:
+- Return ONLY valid JSON
+- Preserve meaning
+- Do not invent a new question
+- If the source uses "question" instead of "stem", map it to "stem"
+- If options are flat fields, convert them into the nested options object
+- correct_option must be exactly one of A, B, C, D
+
+Input JSON:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+""".strip()
+
+    return call_model_json(model, repair_prompt, item_seq)
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+def debug_source_items() -> None:
+    source_items = load_source_items_from_pdf(SOURCE_ITEMS_PDF)
+    print(f"Parsed {len(source_items)} source items from PDF")
+    for k in sorted(source_items.keys())[:3]:
+        item = source_items[k]
+        print(f"\nItem {k}")
+        print("Stem:", item["stem"][:200])
+        print("A:", item["options"]["A"])
+        print("B:", item["options"]["B"])
+        print("C:", item["options"]["C"])
+        print("D:", item["options"]["D"])
+
+
+def generate_parallel_form() -> tuple[List[GeneratedItem], List[Dict[str, Any]]]:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    model = configure_model()
+    blueprint = build_blueprint()
+
+    generated_items: List[GeneratedItem] = []
+    failed_items: List[Dict[str, Any]] = []
+
+    for bp in blueprint:
+        print(f"Generating item {bp.item_seq}/{len(blueprint)} | {bp.attribute}")
+        prompt = build_generation_prompt(bp)
+
+        try:
+            payload = call_model_json(model, prompt, bp.item_seq)
+
+            try:
+                cleaned = validate_generated_payload(payload)
+            except Exception:
+                repaired_payload = repair_payload_schema(model, payload, bp.item_seq)
+                cleaned = validate_generated_payload(repaired_payload)
+                payload = repaired_payload
+
+            generated_items.append(
+                GeneratedItem(
+                    form_id=FORM_ID,
+                    item_seq=bp.item_seq,
+                    source_item_seq=bp.item_seq,
+                    attribute=bp.attribute,
+                    target_p_value=bp.target_p_value,
+                    target_rasch_beta=bp.target_rasch_beta,
+                    stem=cleaned["stem"],
+                    options=cleaned["options"],
+                    correct_option=cleaned["correct_option"],
+                    explanation=cleaned["explanation"],
+                    distractor_analysis=cleaned["distractor_analysis"],
+                    notation_style="plain_utf8",
+                )
+            )
+
+        except Exception as e:
+            bad_path = OUTPUT_DIR / f"bad_payload_item_{bp.item_seq}.json"
+            bad_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with bad_path.open("w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)  # type: ignore[name-defined]
+            except Exception:
+                pass
+
+            failed_items.append({
+                "item_seq": bp.item_seq,
+                "attribute": bp.attribute,
+                "error": str(e),
+            })
+            print(f"Skipped item {bp.item_seq}: {e}")
+
+        time.sleep(SLEEP_BETWEEN_CALLS)
+
+    return generated_items, failed_items
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+def save_outputs(items: List[GeneratedItem], failed_items: List[Dict[str, Any]]) -> None:
+    json_path = OUTPUT_DIR / f"form_{FORM_ID}.json"
+    jsonl_path = OUTPUT_DIR / f"form_{FORM_ID}.jsonl"
+    csv_path = OUTPUT_DIR / f"form_{FORM_ID}_summary.csv"
+    answer_key_path = OUTPUT_DIR / f"form_{FORM_ID}_answer_key.txt"
+    failed_path = OUTPUT_DIR / f"form_{FORM_ID}_failed_items.json"
+
+    payload = {
+        "form_id": FORM_ID,
+        "n_items_requested": N_ITEMS,
+        "n_items_generated": len(items),
+        "n_items_failed": len(failed_items),
+        "items": [asdict(item) for item in items],
+    }
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(asdict(item), ensure_ascii=False) + "\n")
+
+    if items:
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+            fieldnames = [
+                "form_id", "item_seq", "source_item_seq", "attribute",
+                "target_p_value", "target_rasch_beta", "correct_option", "stem",
+                "option_A", "option_B", "option_C", "option_D"
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in items:
+                writer.writerow({
+                    "form_id": item.form_id,
+                    "item_seq": item.item_seq,
+                    "source_item_seq": item.source_item_seq,
+                    "attribute": item.attribute,
+                    "target_p_value": item.target_p_value,
+                    "target_rasch_beta": item.target_rasch_beta,
+                    "correct_option": item.correct_option,
+                    "stem": item.stem,
+                    "option_A": item.options["A"],
+                    "option_B": item.options["B"],
+                    "option_C": item.options["C"],
+                    "option_D": item.options["D"],
+                })
+
+        with answer_key_path.open("w", encoding="utf-8") as f:
+            f.write(f"Form {FORM_ID} answer key\n")
+            for item in items:
+                f.write(f"{item.item_seq}. {item.correct_option}\n")
+
+    with failed_path.open("w", encoding="utf-8") as f:
+        json.dump(failed_items, f, indent=2, ensure_ascii=False)
+
+    print(f"\nSaved:")
+    print(f"- {json_path}")
+    print(f"- {jsonl_path}")
+    if items:
+        print(f"- {csv_path}")
+        print(f"- {answer_key_path}")
+    print(f"- {failed_path}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    random.seed(42)
+    if DEBUG_SOURCE_PARSE:
+        debug_source_items()
+
+    items, failed_items = generate_parallel_form()
+    save_outputs(items, failed_items)
+
+    print(f"\nDone. Generated {len(items)} items for Form {FORM_ID}.")
+    if failed_items:
+        print(f"Skipped {len(failed_items)} items. See form_{FORM_ID}_failed_items.json")
+
+
+if __name__ == "__main__":
+    main()
